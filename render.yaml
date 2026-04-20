@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: fisiolab-backend
+    runtime: docker
+    plan: free
+    envVars:
+      - key: SPRING_DATASOURCE_URL
+        sync: false
+      - key: SPRING_DATASOURCE_USERNAME
+        sync: false
+      - key: SPRING_DATASOURCE_PASSWORD
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_EXPIRATION
+        value: "1800000"
+      - key: JWT_REFRESH_EXPIRATION
+        value: "604800000"
+      - key: SPRING_JPA_HIBERNATE_DDL_AUTO
+        value: update
+      - key: SPRING_JPA_SHOW_SQL
+        value: "false"
+      - key: APP_TIMEZONE
+        value: America/Bogota
+      - key: APP_UNIDAD_SALUD
+        value: Clinica Fisiolab
+      - key: AUTH_MAX_FAILED_ATTEMPTS
+        value: "5"
+      - key: AUTH_LOCK_MINUTES
+        value: "15"
+      - key: RATE_LIMIT_AUTH_CAPACITY
+        value: "10"
+      - key: RATE_LIMIT_AUTH_WINDOW_SECONDS
+        value: "60"
+      - key: APP_STORAGE_PATH
+        value: ./uploads
+      - key: SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE
+        value: 10MB
+      - key: SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE
+        value: 20MB

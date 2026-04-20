@@ -1,0 +1,357 @@
+package com.app.fisiolab_system.service;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.stereotype.Service;
+
+import com.app.fisiolab_system.dto.ActualizarEstadoCitaRequest;
+import com.app.fisiolab_system.dto.CalendarEventResponse;
+import com.app.fisiolab_system.dto.CitaResponse;
+import com.app.fisiolab_system.dto.CrearCitaRequest;
+import com.app.fisiolab_system.event.CitaRealizadaEvent;
+import com.app.fisiolab_system.model.Cita;
+import com.app.fisiolab_system.model.EstadoArchivoPaciente;
+import com.app.fisiolab_system.model.EstadoCita;
+import com.app.fisiolab_system.model.Paciente;
+import com.app.fisiolab_system.model.RolUsuario;
+import com.app.fisiolab_system.model.Usuario;
+import com.app.fisiolab_system.repository.BloqueoAgendaRepository;
+import com.app.fisiolab_system.repository.CitaRepository;
+import com.app.fisiolab_system.repository.PacienteRepository;
+import com.app.fisiolab_system.repository.PlanTratamientoRepository;
+import com.app.fisiolab_system.repository.UsuarioRepository;
+
+import jakarta.transaction.Transactional;
+
+@Service
+@Transactional
+public class CitaService {
+
+    private static final Map<EstadoCita, String> COLOR_POR_ESTADO = Map.of(
+            EstadoCita.PROGRAMADA, "#3B82F6",
+            EstadoCita.REALIZADA, "#10B981",
+            EstadoCita.CANCELADA, "#6B7280",
+            EstadoCita.NO_ASISTIDA, "#F59E0B"
+    );
+
+    private final CitaRepository citaRepository;
+    private final BloqueoAgendaRepository bloqueoAgendaRepository;
+    private final PacienteRepository pacienteRepository;
+    private final UsuarioRepository usuarioRepository;
+    private final PlanTratamientoRepository planRepository;
+    private final AuditoriaService auditoriaService;
+    private final ApplicationEventPublisher eventPublisher;
+
+    public CitaService(CitaRepository citaRepository,
+            BloqueoAgendaRepository bloqueoAgendaRepository,
+            PacienteRepository pacienteRepository,
+            UsuarioRepository usuarioRepository,
+            PlanTratamientoRepository planRepository,
+            AuditoriaService auditoriaService,
+            ApplicationEventPublisher eventPublisher) {
+        this.citaRepository = citaRepository;
+        this.bloqueoAgendaRepository = bloqueoAgendaRepository;
+        this.pacienteRepository = pacienteRepository;
+        this.usuarioRepository = usuarioRepository;
+        this.planRepository = planRepository;
+        this.auditoriaService = auditoriaService;
+        this.eventPublisher = eventPublisher;
+    }
+
+    // ─── CREAR ────────────────────────────────────────────────────────────────
+
+    public CitaResponse crearCita(CrearCitaRequest request, String actorEmail, String clientIp) {
+        Usuario actor = resolverUsuario(actorEmail);
+        validarRangoFechas(request.fechaHoraInicio(), request.fechaHoraFin());
+
+        // FISIOTERAPEUTA solo puede agendar en su propia agenda
+        if (actor.getRol() == RolUsuario.FISIOTERAPEUTA
+                && !request.profesionalId().equals(actor.getId())) {
+            throw new AccessDeniedException("Solo puede agendar citas en su propia agenda.");
+        }
+
+        Paciente paciente = pacienteRepository.findById(request.pacienteId())
+                .orElseThrow(() -> new IllegalArgumentException("Paciente no encontrado: " + request.pacienteId()));
+        if (paciente.getEstadoArchivo() != EstadoArchivoPaciente.ACTIVO) {
+            throw new IllegalArgumentException("El paciente se encuentra en estado PASIVO y no puede ser agendado.");
+        }
+
+        Usuario profesional = resolverProfesional(request.profesionalId());
+
+        validarDisponibilidad(request.profesionalId(), request.fechaHoraInicio(), request.fechaHoraFin(), null);
+
+        // Validate plan belongs to episodio when both are provided
+        if (request.planTratamientoId() != null) {
+            if (request.episodioClinicoId() == null) {
+                throw new IllegalArgumentException("Se requiere episodioClinicoId cuando se especifica planTratamientoId.");
+            }
+            planRepository.findByIdAndEpisodioClinicoId(request.planTratamientoId(), request.episodioClinicoId())
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "El plan #" + request.planTratamientoId()
+                                    + " no pertenece al episodio #" + request.episodioClinicoId()));
+        }
+
+        Cita cita = Cita.builder()
+                .paciente(paciente)
+                .profesional(profesional)
+                .creadoPor(actor)
+                .fechaHoraInicio(request.fechaHoraInicio())
+                .fechaHoraFin(request.fechaHoraFin())
+                .estado(EstadoCita.PROGRAMADA)
+                .motivoConsulta(request.motivoConsulta().trim())
+                .codigoCie10Sugerido(normalizeNullable(request.codigoCie10Sugerido()))
+                .observaciones(normalizeNullable(request.observaciones()))
+                .episodioClinicoId(request.episodioClinicoId())
+                .planTratamientoId(request.planTratamientoId())
+                .build();
+
+        Cita saved = citaRepository.save(cita);
+
+        auditoriaService.registrar(actor.getId(),
+                "CITA_CREADA",
+                "Cita creada para paciente %s con profesional %s en %s".formatted(
+                        paciente.getNumeroHcl(),
+                        profesional.getEmail(),
+                        saved.getFechaHoraInicio()),
+                clientIp);
+
+        return toResponse(saved);
+    }
+
+    // ─── LISTAR ───────────────────────────────────────────────────────────────
+
+    public List<CitaResponse> listarCitas(String actorEmail) {
+        Usuario actor = resolverUsuario(actorEmail);
+        List<Cita> citas = actor.getRol() == RolUsuario.FISIOTERAPEUTA
+                ? citaRepository.findByProfesionalIdOrderByFechaHoraInicioAsc(actor.getId())
+                : citaRepository.findAllByOrderByFechaHoraInicioAsc();
+        return citas.stream().map(this::toResponse).toList();
+    }
+
+    public CitaResponse obtenerPorId(Long citaId, String actorEmail) {
+        Cita cita = resolverCita(citaId);
+        validarOwnership(cita, resolverUsuario(actorEmail));
+        return toResponse(cita);
+    }
+
+    // ─── CAMBIAR ESTADO ───────────────────────────────────────────────────────
+
+    public CitaResponse actualizarEstado(Long citaId, ActualizarEstadoCitaRequest request,
+            String actorEmail, String clientIp) {
+        Cita cita = resolverCita(citaId);
+        Usuario actor = resolverUsuario(actorEmail);
+        validarOwnership(cita, actor);
+        validarTransicionEstado(cita.getEstado(), request.nuevoEstado());
+
+        EstadoCita estadoAnterior = cita.getEstado();
+        cita.setEstado(request.nuevoEstado());
+
+        if (request.observaciones() != null && !request.observaciones().isBlank()) {
+            cita.setObservaciones(request.observaciones().trim());
+        }
+
+        Cita saved = citaRepository.save(cita);
+
+        auditoriaService.registrar(actor.getId(),
+                "CITA_ESTADO_CAMBIADO",
+                "Cita %d: %s → %s".formatted(citaId, estadoAnterior, request.nuevoEstado()),
+                clientIp);
+
+        // Traspaso de contexto al Módulo 7 cuando la cita se marca como REALIZADA
+        if (request.nuevoEstado() == EstadoCita.REALIZADA) {
+            eventPublisher.publishEvent(new CitaRealizadaEvent(
+                    saved.getId(),
+                    saved.getPaciente().getId(),
+                    saved.getProfesional().getId(),
+                    saved.getEpisodioClinicoId(),
+                    saved.getPlanTratamientoId(),
+                    saved.getMotivoConsulta(),
+                    saved.getCodigoCie10Sugerido(),
+                    saved.getFechaHoraInicio()));
+        }
+
+        return toResponse(saved);
+    }
+
+    // ─── DISPONIBILIDAD ───────────────────────────────────────────────────────
+
+    public boolean verificarDisponibilidad(Long profesionalId, LocalDateTime inicio, LocalDateTime fin) {
+        long solapamientosCitas = citaRepository.contarSolapamientos(profesionalId, inicio, fin, null);
+        long solapamientosBloqueos = bloqueoAgendaRepository.contarBloqueosSolapados(profesionalId, inicio, fin);
+        return solapamientosCitas == 0 && solapamientosBloqueos == 0;
+    }
+
+    // ─── AGENDA VIEW (FullCalendar) ───────────────────────────────────────────
+
+    public List<CalendarEventResponse> getAgendaView(Long profesionalId, LocalDateTime desde,
+            LocalDateTime hasta, String actorEmail) {
+        Usuario actor = resolverUsuario(actorEmail);
+
+        // FISIOTERAPEUTA solo puede ver su propia agenda
+        Long idEfectivo;
+        if (actor.getRol() == RolUsuario.FISIOTERAPEUTA) {
+            idEfectivo = actor.getId();
+        } else {
+            idEfectivo = (profesionalId != null) ? profesionalId : null;
+        }
+
+        List<CalendarEventResponse> eventos;
+
+        if (idEfectivo != null) {
+            List<Cita> citas = citaRepository.findByProfesionalAndRango(idEfectivo, desde, hasta);
+            List<com.app.fisiolab_system.model.BloqueoAgenda> bloqueos =
+                    bloqueoAgendaRepository.findByProfesionalAndRango(idEfectivo, desde, hasta);
+            eventos = buildEventos(citas, bloqueos);
+        } else {
+            // ADMIN sin filtro de profesional: muestra todo
+            List<Cita> citas = citaRepository.findAllByRango(desde, hasta);
+            List<com.app.fisiolab_system.model.BloqueoAgenda> bloqueos =
+                    bloqueoAgendaRepository.findAllByRango(desde, hasta);
+            eventos = buildEventos(citas, bloqueos);
+        }
+
+        return eventos;
+    }
+
+    // ─── VALIDACIONES ─────────────────────────────────────────────────────────
+
+    private void validarDisponibilidad(Long profesionalId, LocalDateTime inicio,
+            LocalDateTime fin, Long excludeId) {
+        long solapamientosCitas = citaRepository.contarSolapamientos(profesionalId, inicio, fin, excludeId);
+        if (solapamientosCitas > 0) {
+            throw new IllegalArgumentException(
+                    "El profesional ya tiene una cita programada en ese horario.");
+        }
+
+        long solapamientosBloqueos = bloqueoAgendaRepository.contarBloqueosSolapados(profesionalId, inicio, fin);
+        if (solapamientosBloqueos > 0) {
+            throw new IllegalArgumentException(
+                    "El profesional tiene un bloqueo de agenda en ese horario (vacaciones/permiso).");
+        }
+    }
+
+    private void validarOwnership(Cita cita, Usuario actor) {
+        if (actor.getRol() == RolUsuario.FISIOTERAPEUTA
+                && !cita.getProfesional().getId().equals(actor.getId())) {
+            throw new AccessDeniedException("No tiene permiso para gestionar esta cita.");
+        }
+    }
+
+    private void validarRangoFechas(LocalDateTime inicio, LocalDateTime fin) {
+        if (!fin.isAfter(inicio)) {
+            throw new IllegalArgumentException("La fecha y hora de fin debe ser posterior al inicio.");
+        }
+    }
+
+    private void validarTransicionEstado(EstadoCita actual, EstadoCita nuevo) {
+        if (actual == EstadoCita.REALIZADA || actual == EstadoCita.CANCELADA) {
+            throw new IllegalArgumentException(
+                    "Una cita en estado %s no puede ser modificada.".formatted(actual));
+        }
+        if (actual == EstadoCita.NO_ASISTIDA && nuevo != EstadoCita.PROGRAMADA) {
+            throw new IllegalArgumentException(
+                    "Una cita NO_ASISTIDA solo puede reprogramarse a PROGRAMADA.");
+        }
+    }
+
+    // ─── MAPPERS ──────────────────────────────────────────────────────────────
+
+    CitaResponse toResponse(Cita cita) {
+        String profesionalNombre = cita.getProfesional().getName() + " " + cita.getProfesional().getLastName();
+        String creadoPorNombre = cita.getCreadoPor().getName() + " " + cita.getCreadoPor().getLastName();
+        return new CitaResponse(
+                cita.getId(),
+                cita.getPaciente().getId(),
+                cita.getPaciente().getNombresCompletos(),
+                cita.getPaciente().getCedula(),
+                cita.getProfesional().getId(),
+                profesionalNombre,
+                cita.getCreadoPor().getId(),
+                creadoPorNombre,
+                cita.getFechaHoraInicio(),
+                cita.getFechaHoraFin(),
+                cita.getEstado(),
+                cita.getMotivoConsulta(),
+                cita.getCodigoCie10Sugerido(),
+                cita.getObservaciones(),
+                cita.getEpisodioClinicoId(),
+                cita.getPlanTratamientoId(),
+                cita.getSesionGeneradaId(),
+                cita.getFechaCreacion(),
+                cita.getFechaModificacion());
+    }
+
+    private List<CalendarEventResponse> buildEventos(List<Cita> citas,
+            List<com.app.fisiolab_system.model.BloqueoAgenda> bloqueos) {
+        List<CalendarEventResponse> resultado = new java.util.ArrayList<>();
+
+        for (Cita c : citas) {
+            String titulo = c.getPaciente().getNombresCompletos() + " — " + c.getMotivoConsulta();
+            resultado.add(new CalendarEventResponse(
+                    "cita-" + c.getId(),
+                    titulo,
+                    c.getFechaHoraInicio(),
+                    c.getFechaHoraFin(),
+                    COLOR_POR_ESTADO.getOrDefault(c.getEstado(), "#3B82F6"),
+                    "CITA",
+                    Map.of(
+                            "estado", c.getEstado().name(),
+                            "pacienteId", c.getPaciente().getId(),
+                            "profesionalNombre",
+                            c.getProfesional().getName() + " " + c.getProfesional().getLastName(),
+                            "citaId", c.getId())));
+        }
+
+        for (com.app.fisiolab_system.model.BloqueoAgenda b : bloqueos) {
+            String titulo = b.getMotivo().name() + " — "
+                    + b.getProfesional().getName() + " " + b.getProfesional().getLastName();
+            resultado.add(new CalendarEventResponse(
+                    "bloqueo-" + b.getId(),
+                    titulo,
+                    b.getFechaHoraInicio(),
+                    b.getFechaHoraFin(),
+                    "#EF4444",
+                    "BLOQUEO",
+                    Map.of(
+                            "motivo", b.getMotivo().name(),
+                            "profesionalId", b.getProfesional().getId(),
+                            "descripcion", b.getDescripcion() != null ? b.getDescripcion() : "")));
+        }
+
+        return resultado;
+    }
+
+    // ─── HELPERS ──────────────────────────────────────────────────────────────
+
+    private Usuario resolverUsuario(String email) {
+        return usuarioRepository.findByEmail(email)
+                .orElseThrow(() -> new IllegalArgumentException("Usuario no encontrado: " + email));
+    }
+
+    private Usuario resolverProfesional(Long profesionalId) {
+        Usuario profesional = usuarioRepository.findById(profesionalId)
+                .orElseThrow(() -> new IllegalArgumentException("Profesional no encontrado: " + profesionalId));
+        if (profesional.getRol() != RolUsuario.FISIOTERAPEUTA) {
+            throw new IllegalArgumentException("El usuario seleccionado no es un Fisioterapeuta.");
+        }
+        if (!profesional.isActivo()) {
+            throw new IllegalArgumentException("El profesional seleccionado no está activo.");
+        }
+        return profesional;
+    }
+
+    private Cita resolverCita(Long citaId) {
+        return citaRepository.findById(citaId)
+                .orElseThrow(() -> new IllegalArgumentException("Cita no encontrada: " + citaId));
+    }
+
+    private String normalizeNullable(String value) {
+        if (value == null) return null;
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+}

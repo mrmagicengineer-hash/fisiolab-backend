@@ -1,0 +1,398 @@
+package com.app.fisiolab_system.service;
+
+import java.time.LocalDate;
+import java.util.List;
+
+import org.springframework.stereotype.Service;
+
+import com.app.fisiolab_system.dto.CreatePlanTratamientoRequest;
+import com.app.fisiolab_system.dto.CreateSeguimientoPlanRequest;
+import com.app.fisiolab_system.dto.IndicadorAvancePlanResponse;
+import com.app.fisiolab_system.dto.PlanTratamientoResponse;
+import com.app.fisiolab_system.dto.SeguimientoPlanResponse;
+import com.app.fisiolab_system.model.CodigoAlarma;
+import com.app.fisiolab_system.model.EpisodioClinico;
+import com.app.fisiolab_system.model.EstadoPlan;
+import com.app.fisiolab_system.model.EstadoProblemaEpisodio;
+import com.app.fisiolab_system.model.PlanTratamiento;
+import com.app.fisiolab_system.model.ProblemaEpisodio;
+import com.app.fisiolab_system.model.ResultadoGeneral;
+import com.app.fisiolab_system.model.SeguimientoPlan;
+import com.app.fisiolab_system.model.Usuario;
+import com.app.fisiolab_system.repository.EpisodioClinicoRepository;
+import com.app.fisiolab_system.repository.NotaSOAPRepository;
+import com.app.fisiolab_system.repository.PlanTratamientoRepository;
+import com.app.fisiolab_system.repository.ProblemaEpisodioRepository;
+import com.app.fisiolab_system.repository.SeguimientoPlanRepository;
+import com.app.fisiolab_system.repository.SesionTerapiaRepository;
+import com.app.fisiolab_system.repository.UsuarioRepository;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import jakarta.transaction.Transactional;
+
+@Service
+@Transactional
+public class PlanTratamientoServiceImpl implements PlanTratamientoService {
+
+    private static final TypeReference<List<String>> STRING_LIST_TYPE = new TypeReference<>() {};
+
+    private final PlanTratamientoRepository planRepo;
+    private final SeguimientoPlanRepository seguimientoRepo;
+    private final EpisodioClinicoRepository episodioRepo;
+    private final ProblemaEpisodioRepository problemaRepo;
+    private final UsuarioRepository usuarioRepo;
+    private final AuditoriaService auditoriaService;
+    private final ObjectMapper objectMapper;
+    private final SesionTerapiaRepository sesionRepo;
+    private final NotaSOAPRepository notaSOAPRepo;
+
+    public PlanTratamientoServiceImpl(
+            PlanTratamientoRepository planRepo,
+            SeguimientoPlanRepository seguimientoRepo,
+            EpisodioClinicoRepository episodioRepo,
+            ProblemaEpisodioRepository problemaRepo,
+            UsuarioRepository usuarioRepo,
+            AuditoriaService auditoriaService,
+            ObjectMapper objectMapper,
+            SesionTerapiaRepository sesionRepo,
+            NotaSOAPRepository notaSOAPRepo) {
+        this.planRepo = planRepo;
+        this.seguimientoRepo = seguimientoRepo;
+        this.episodioRepo = episodioRepo;
+        this.problemaRepo = problemaRepo;
+        this.usuarioRepo = usuarioRepo;
+        this.auditoriaService = auditoriaService;
+        this.objectMapper = objectMapper;
+        this.sesionRepo = sesionRepo;
+        this.notaSOAPRepo = notaSOAPRepo;
+    }
+
+    // -------------------------------------------------------------------------
+    // RF-31: Creación del plan
+    // -------------------------------------------------------------------------
+
+    @Override
+    public PlanTratamientoResponse crearPlan(Long episodioId, Long problemaId,
+            CreatePlanTratamientoRequest request, String actorEmail, String clientIp) {
+
+        EpisodioClinico episodio = getEpisodioOrThrow(episodioId);
+        ProblemaEpisodio problema = getProblemaOrThrow(problemaId, episodioId);
+
+        if (problema.getEstado() != EstadoProblemaEpisodio.ACTIVO
+                && problema.getEstado() != EstadoProblemaEpisodio.CRONICO) {
+            throw new IllegalArgumentException(
+                    "Solo se puede crear un plan para problemas en estado ACTIVO o CRONICO.");
+        }
+
+        if (planRepo.existsByProblemaEpisodioId(problemaId)) {
+            throw new IllegalArgumentException(
+                    "Ya existe un plan de tratamiento para este problema.");
+        }
+
+        PlanTratamiento plan = PlanTratamiento.builder()
+                .episodioClinico(episodio)
+                .problemaEpisodio(problema)
+                .objetivoGeneral(request.objetivos().trim())
+                .objetivosEspecificosJson(toJson(List.of()))
+                .fechaInicio(LocalDate.now())
+                .fechaFinEstimada(LocalDate.now().plusMonths(1))
+                .sesionesPlanificadas(request.sesionesPlanificadas())
+                .costoSesion(request.costoSesion())
+                .indicacionesEducativas(null)
+                .codigoAlarma(CodigoAlarma.VERDE)
+                .estado(EstadoPlan.ACTIVO)
+                .build();
+
+        plan = planRepo.save(plan);
+
+        auditar(actorEmail, "CREACION_PLAN_TRATAMIENTO",
+                "Plan creado para problema #" + problema.getNumeroSecuencial()
+                        + " del episodio " + episodio.getNumeroEpisodio(),
+                clientIp);
+
+        return toResponse(plan, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Consultas de planes
+    // -------------------------------------------------------------------------
+
+    @Override
+    public PlanTratamientoResponse obtenerPlanPorProblema(Long episodioId, Long problemaId) {
+        getProblemaOrThrow(problemaId, episodioId);
+        PlanTratamiento plan = planRepo.findByProblemaEpisodioId(problemaId)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No existe plan de tratamiento para este problema."));
+        int sesionesRealizadas = (int) seguimientoRepo.countByPlanTratamientoId(plan.getId());
+        return toResponse(plan, sesionesRealizadas);
+    }
+
+    @Override
+    public List<PlanTratamientoResponse> listarPorEpisodio(Long episodioId) {
+        if (!episodioRepo.existsById(episodioId)) {
+            throw new IllegalArgumentException("Episodio no encontrado: " + episodioId);
+        }
+        return planRepo.findByEpisodioClinicoIdOrderByFechaCreacionDesc(episodioId).stream()
+                .map(plan -> {
+                    int realizadas = (int) seguimientoRepo.countByPlanTratamientoId(plan.getId());
+                    return toResponse(plan, realizadas);
+                })
+                .toList();
+    }
+
+    // -------------------------------------------------------------------------
+    // RF-32: Seguimiento del plan
+    // -------------------------------------------------------------------------
+
+    @Override
+    public SeguimientoPlanResponse registrarSeguimiento(Long episodioId, Long problemaId,
+            CreateSeguimientoPlanRequest request, String actorEmail, String clientIp) {
+
+        getProblemaOrThrow(problemaId, episodioId);
+        PlanTratamiento plan = planRepo.findByProblemaEpisodioId(problemaId)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No existe plan de tratamiento para este problema."));
+
+        if (plan.getEstado() != EstadoPlan.ACTIVO) {
+            throw new IllegalArgumentException(
+                    "No se pueden registrar seguimientos en un plan " + plan.getEstado() + ".");
+        }
+
+        int siguienteNumero = seguimientoRepo.findMaxNumeroSesionByPlanId(plan.getId()) + 1;
+
+        SeguimientoPlan seguimiento = SeguimientoPlan.builder()
+                .planTratamiento(plan)
+                .numeroSesion(siguienteNumero)
+                .fechaSeguimiento(request.fechaSeguimiento())
+                .porcentajeAvance(request.porcentajeAvance())
+                .resultadosObtenidos(request.resultadosObtenidos().trim())
+                .ajustes(request.ajustes() != null ? request.ajustes().trim() : null)
+                .resultadoGeneral(request.resultadoGeneral())
+                .build();
+
+        seguimiento = seguimientoRepo.save(seguimiento);
+
+        // Cierra el plan automáticamente si el resultado es ALTA o ABANDONO
+        if (request.resultadoGeneral() == ResultadoGeneral.ALTA) {
+            plan.setEstado(EstadoPlan.COMPLETADO);
+        } else if (request.resultadoGeneral() == ResultadoGeneral.ABANDONO) {
+            plan.setEstado(EstadoPlan.ABANDONADO);
+        } else if (siguienteNumero >= plan.getSesionesPlanificadas()
+                && request.resultadoGeneral() == ResultadoGeneral.MEJORA) {
+            // Todas las sesiones completadas con resultado positivo
+            plan.setEstado(EstadoPlan.COMPLETADO);
+        }
+        planRepo.save(plan);
+
+        auditar(actorEmail, "REGISTRO_SEGUIMIENTO_PLAN",
+                "Sesion #" + siguienteNumero + " registrada para plan #" + plan.getId(),
+                clientIp);
+
+        return toSeguimientoResponse(seguimiento);
+    }
+
+    @Override
+    public List<SeguimientoPlanResponse> listarSeguimientos(Long episodioId, Long problemaId) {
+        getProblemaOrThrow(problemaId, episodioId);
+        PlanTratamiento plan = planRepo.findByProblemaEpisodioId(problemaId)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No existe plan de tratamiento para este problema."));
+        return seguimientoRepo.findByPlanTratamientoIdOrderByNumeroSesionAsc(plan.getId())
+                .stream()
+                .map(this::toSeguimientoResponse)
+                .toList();
+    }
+
+    // -------------------------------------------------------------------------
+    // RF-33: Indicador de avance de sesiones
+    // -------------------------------------------------------------------------
+
+    @Override
+    public IndicadorAvancePlanResponse obtenerIndicador(Long episodioId, Long problemaId) {
+        getProblemaOrThrow(problemaId, episodioId);
+        PlanTratamiento plan = planRepo.findByProblemaEpisodioId(problemaId)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No existe plan de tratamiento para este problema."));
+
+        int realizadas = (int) seguimientoRepo.countByPlanTratamientoId(plan.getId());
+        int porcentaje = calcularPorcentaje(realizadas, plan.getSesionesPlanificadas());
+
+        return new IndicadorAvancePlanResponse(
+                plan.getId(),
+                realizadas,
+                plan.getSesionesPlanificadas(),
+                porcentaje,
+                plan.getEstado(),
+                plan.getCodigoAlarma());
+    }
+
+    // -------------------------------------------------------------------------
+    // Resumen por paciente (columna de navegación)
+    // -------------------------------------------------------------------------
+
+    @Override
+    public java.util.List<com.app.fisiolab_system.dto.PacienteResumenPlanesResponse> listarResumenPorPaciente() {
+        List<PlanTratamiento> activos = planRepo.findAllActivoWithPatientDetails();
+
+        // Agrupa por pacienteId, calcula peorAlarma y conteo
+        java.util.Map<Long, java.util.List<PlanTratamiento>> porPaciente = activos.stream()
+            .collect(java.util.stream.Collectors.groupingBy(
+                p -> p.getEpisodioClinico().getHistoriaClinica().getPaciente().getId()
+            ));
+
+        return porPaciente.entrySet().stream()
+            .map(entry -> {
+                List<PlanTratamiento> planes = entry.getValue();
+                PlanTratamiento primero = planes.get(0);
+                com.app.fisiolab_system.model.Paciente pac =
+                    primero.getEpisodioClinico().getHistoriaClinica().getPaciente();
+
+                CodigoAlarma peorAlarma = planes.stream()
+                    .map(PlanTratamiento::getCodigoAlarma)
+                    .filter(a -> a != null)
+                    .max(java.util.Comparator.comparingInt(Enum::ordinal))
+                    .orElse(CodigoAlarma.VERDE);
+
+                return com.app.fisiolab_system.dto.PacienteResumenPlanesResponse.builder()
+                    .pacienteId(pac.getId())
+                    .pacienteNombre(pac.getNombresCompletos())
+                    .hcl(primero.getEpisodioClinico().getHistoriaClinica().getNumeroHcl())
+                    .peorAlarma(peorAlarma.name())
+                    .conteoPlanesActivos(planes.size())
+                    .build();
+            })
+            .sorted(java.util.Comparator.comparing(com.app.fisiolab_system.dto.PacienteResumenPlanesResponse::getPacienteNombre))
+            .toList();
+    }
+
+    @Override
+    public java.util.List<com.app.fisiolab_system.dto.TimelineItemResponse> getTimeline(Long planId) {
+        if (!planRepo.existsById(planId)) {
+            throw new IllegalArgumentException("Plan no encontrado: " + planId);
+        }
+
+        java.util.List<com.app.fisiolab_system.dto.TimelineItemResponse> items = new java.util.ArrayList<>();
+
+        // Sesiones SOAP vinculadas al plan
+        sesionRepo.findByPlanTratamientoIdOrderByNumeroSesionEnPlanAsc(planId).forEach(s -> {
+            boolean firmada = notaSOAPRepo.findBySesionTerapiaId(s.getId())
+                .map(n -> !n.isModoBorrador())
+                .orElse(false);
+            items.add(com.app.fisiolab_system.dto.TimelineItemResponse.builder()
+                .tipo("SESION_SOAP")
+                .itemId(s.getId())
+                .fecha(s.getFechaHoraInicio())
+                .numeroSesion(s.getNumeroSesionEnPlan())
+                .resumen("Sesión #" + s.getNumeroSesionEnPlan() + " — " + s.getEstado().name())
+                .estadoSesion(s.getEstado().name())
+                .notaFirmada(firmada)
+                .build());
+        });
+
+        // Seguimientos del plan
+        seguimientoRepo.findByPlanTratamientoIdOrderByNumeroSesionAsc(planId).forEach(sg -> {
+            items.add(com.app.fisiolab_system.dto.TimelineItemResponse.builder()
+                .tipo("SEGUIMIENTO_PLAN")
+                .itemId(sg.getId())
+                .fecha(sg.getFechaSeguimiento().atStartOfDay())
+                .numeroSesion(sg.getNumeroSesion())
+                .resumen("Seguimiento #" + sg.getNumeroSesion() + " — " + sg.getResultadoGeneral().name())
+                .resultadoGeneral(sg.getResultadoGeneral().name())
+                .porcentajeAvance(sg.getPorcentajeAvance())
+                .build());
+        });
+
+        items.sort(java.util.Comparator.comparing(com.app.fisiolab_system.dto.TimelineItemResponse::getFecha));
+        return java.util.Collections.unmodifiableList(items);
+    }
+
+    @Override
+    public com.app.fisiolab_system.dto.EstadisticasDashboardResponse obtenerEstadisticasDashboard() {
+        long total = planRepo.countActivos();
+        long enRiesgo = planRepo.countActivosByAlarmas(
+            java.util.List.of(CodigoAlarma.NARANJA, CodigoAlarma.ROJO));
+        long finalizando = planRepo.countActivosFinalizando(0.8);
+        return new com.app.fisiolab_system.dto.EstadisticasDashboardResponse(total, enRiesgo, finalizando);
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers internos
+    // -------------------------------------------------------------------------
+
+    private EpisodioClinico getEpisodioOrThrow(Long episodioId) {
+        return episodioRepo.findById(episodioId)
+                .orElseThrow(() -> new IllegalArgumentException("Episodio no encontrado: " + episodioId));
+    }
+
+    private ProblemaEpisodio getProblemaOrThrow(Long problemaId, Long episodioId) {
+        ProblemaEpisodio problema = problemaRepo.findById(problemaId)
+                .orElseThrow(() -> new IllegalArgumentException("Problema no encontrado: " + problemaId));
+        if (!problema.getEpisodioClinico().getId().equals(episodioId)) {
+            throw new IllegalArgumentException(
+                    "El problema #" + problemaId + " no pertenece al episodio #" + episodioId);
+        }
+        return problema;
+    }
+
+    private int calcularPorcentaje(int realizadas, int planificadas) {
+        if (planificadas == 0) return 0;
+        return Math.min(100, (realizadas * 100) / planificadas);
+    }
+
+    private PlanTratamientoResponse toResponse(PlanTratamiento plan, int sesionesRealizadas) {
+        int porcentaje = calcularPorcentaje(sesionesRealizadas, plan.getSesionesPlanificadas());
+        return new PlanTratamientoResponse(
+                plan.getId(),
+                plan.getEpisodioClinico().getId(),
+                plan.getProblemaEpisodio().getId(),
+                plan.getObjetivoGeneral(),
+                fromJson(plan.getObjetivosEspecificosJson()),
+                plan.getFechaInicio(),
+                plan.getFechaFinEstimada(),
+                plan.getSesionesPlanificadas(),
+                sesionesRealizadas,
+                porcentaje,
+                plan.getIndicacionesEducativas(),
+                plan.getCodigoAlarma(),
+                plan.getEstado(),
+                plan.getFechaCreacion(),
+                plan.getCostoSesion());
+    }
+
+    private SeguimientoPlanResponse toSeguimientoResponse(SeguimientoPlan s) {
+        return new SeguimientoPlanResponse(
+                s.getId(),
+                s.getPlanTratamiento().getId(),
+                s.getNumeroSesion(),
+                s.getFechaSeguimiento(),
+                s.getPorcentajeAvance(),
+                s.getResultadosObtenidos(),
+                s.getAjustes(),
+                s.getResultadoGeneral(),
+                s.getFechaRegistro());
+    }
+
+    private String toJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (Exception ex) {
+            throw new IllegalStateException("Error al serializar datos del plan.", ex);
+        }
+    }
+
+    private List<String> fromJson(String json) {
+        try {
+            return objectMapper.readValue(json, STRING_LIST_TYPE);
+        } catch (Exception ex) {
+            throw new IllegalStateException("Error al deserializar datos del plan.", ex);
+        }
+    }
+
+    private void auditar(String actorEmail, String accion, String detalle, String ip) {
+        Long actorId = usuarioRepo.findByEmail(actorEmail)
+                .map(Usuario::getId)
+                .orElse(0L);
+        auditoriaService.registrar(actorId, accion, detalle, ip);
+    }
+}
